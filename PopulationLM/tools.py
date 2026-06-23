@@ -106,12 +106,25 @@ class StratifiedDropoutMC(DropoutMC):
             m = x.data.new(torch.Size(size)).bernoulli_(1 - self.p)
             self.identity = m.div_(1 - self.p)
 
-        identity_expanded = self.identity.expand_as(x)
-
         if not self.activate or not self.p:
             return x
 
-        return identity_expanded * x
+        # Vectorised single-pass mode (set transiently by PopulationModel): the
+        # incoming batch has been tiled to ``groups * B`` in member-major order,
+        # and ``_vector_identity`` holds the whole population's masks stacked on a
+        # leading axis (shape ``[groups, 1, ..., 1, H]``). Reshape the leading
+        # axis back to ``[groups, B, ...]`` so each member-block sees its own
+        # mask, then flatten again. Valid because every op in a decoder is
+        # independent across the batch axis, so this equals ``groups`` separate
+        # forwards. See PopulationModel.forward(..., vectorized=True).
+        vid = getattr(self, "_vector_identity", None)
+        if vid is not None:
+            groups = self._vector_groups
+            per = x.shape[0] // groups
+            xv = x.view(groups, per, *x.shape[1:])
+            return (xv * vid).reshape(x.shape)
+
+        return self.identity.expand_as(x) * x
 
 
 class LockedDropoutMC(DropoutMC):
@@ -538,6 +551,15 @@ class Population:
         ]
         return self
 
+    def bind(self, model: torch.nn.Module, **kwargs) -> "PopulationModel":
+        """
+        Bind this population to a live (prepared) ``model`` and return a
+        :class:`PopulationModel` whose ``forward`` / ``generate`` / ``__call__``
+        emit population-shaped outputs. Convenience for
+        ``PopulationModel(model, population, **kwargs)``.
+        """
+        return PopulationModel(model, self, **kwargs)
+
     def validate(self, model: torch.nn.Module, strict_class: bool = True):
         """
         Check that this population matches ``model``: every recorded stratified
@@ -596,6 +618,22 @@ def _restore_population_state(model, population: Population):
             mod.p = recorded if recorded else 0.1
             mod.p_init = mod.p
             mod.activate = True
+
+
+def _align_population_device(model, population: Population):
+    """
+    Move a population's masks onto the model's (primary) parameter device.
+
+    A population saved/loaded via torch.save lands on CPU; applying it to a CUDA
+    model would otherwise raise on the mask multiply. This assumes a single-device
+    model -- for ``device_map='auto'`` sharded across several GPUs, load the
+    population with a matching ``map_location`` or split it per layer-device.
+    """
+    try:
+        device = next(model.parameters()).device
+    except StopIteration:
+        return
+    population.to(device)
 
 
 # ---------------------------------------------------------------------------
@@ -698,6 +736,7 @@ def apply_population(
     if validate:
         population.validate(model, strict_class=strict_class)
 
+    _align_population_device(model, population)
     _restore_population_state(model, population)
 
     prev_mode_training = model.training
@@ -753,3 +792,332 @@ def generate_population_and_apply(model, function_to_call, committee_size=20, tr
     if transpose and isinstance(outs[0], list):
         outs = list(map(list, zip(*outs)))
     return outs
+
+# ---------------------------------------------------------------------------
+# Output stacking: turn a list of per-member outputs into a single
+# population-shaped structure (new leading axis P by default).
+# ---------------------------------------------------------------------------
+def _is_model_output(obj) -> bool:
+    """Duck-type a HF ``ModelOutput`` (an OrderedDict subclass) without importing
+    transformers: it is dict-like and exposes ``to_tuple``."""
+    return isinstance(obj, dict) and hasattr(obj, "to_tuple")
+
+
+def _stack_tensors(items: List[torch.Tensor], dim: int, pad_value) -> torch.Tensor:
+    """Stack tensors on a new axis ``dim``. If they disagree in shape (e.g. ragged
+    generation lengths), right-pad each to the elementwise-max shape first."""
+    shapes = [tuple(t.shape) for t in items]
+    if all(s == shapes[0] for s in shapes):
+        return torch.stack(items, dim=dim)
+
+    ndim = items[0].dim()
+    if any(t.dim() != ndim for t in items):
+        # Genuinely incompatible ranks -- refuse to guess; hand back a list.
+        return list(items)  # type: ignore[return-value]
+    max_shape = [max(s[d] for s in shapes) for d in range(ndim)]
+    padded = []
+    for t in items:
+        pad = []
+        for d in reversed(range(ndim)):          # F.pad consumes last dim first
+            pad.extend([0, max_shape[d] - t.shape[d]])
+        padded.append(torch.nn.functional.pad(t, pad, value=pad_value))
+    return torch.stack(padded, dim=dim)
+
+
+def stack_outputs(items, dim: int = 0, *, pad_value=0,
+                  drop_keys=("past_key_values",)):
+    """
+    Recursively combine a list of per-member outputs into one structure with a
+    new population axis at ``dim``.
+
+    * tensors          -> stacked (ragged tensors are right-padded with
+                          ``pad_value``; the common case is ``generate`` output of
+                          differing lengths).
+    * ModelOutput/dict -> same type rebuilt field-wise; ``drop_keys`` (default
+                          ``past_key_values``, which is per-member and not
+                          meaningfully stackable) are omitted.
+    * list/tuple       -> same type, stacked element-wise (e.g. ``hidden_states``).
+    * anything else / mixed / None / ragged-rank -> returned as a plain list along
+                          the member axis (never raises).
+    """
+    items = list(items)
+    if len(items) == 0:
+        return items
+    first = items[0]
+
+    if isinstance(first, torch.Tensor) and all(isinstance(it, torch.Tensor) for it in items):
+        return _stack_tensors(items, dim, pad_value)
+
+    if _is_model_output(first):
+        fields = {}
+        for k in first.keys():
+            if k in drop_keys:
+                continue
+            vals = [it.get(k) for it in items]
+            if all(v is None for v in vals):
+                continue
+            if any(v is None for v in vals):
+                fields[k] = vals                 # mixed presence -> keep as list
+            else:
+                fields[k] = stack_outputs(vals, dim=dim, pad_value=pad_value,
+                                          drop_keys=drop_keys)
+        return type(first)(**fields)
+
+    if isinstance(first, dict):
+        keys = first.keys()
+        return {k: stack_outputs([it[k] for it in items], dim=dim,
+                                 pad_value=pad_value, drop_keys=drop_keys) for k in keys}
+
+    if isinstance(first, (list, tuple)):
+        if any(not isinstance(it, (list, tuple)) or len(it) != len(first) for it in items):
+            return items                         # ragged structure -> list
+        stacked = [stack_outputs([it[i] for it in items], dim=dim,
+                                 pad_value=pad_value, drop_keys=drop_keys)
+                   for i in range(len(first))]
+        return tuple(stacked) if isinstance(first, tuple) else stacked
+
+    # scalars, strings, None, or anything we can't stack.
+    return items
+
+
+def _reshape_leading(obj, groups: int, batch: int, drop_keys=("past_key_values",)):
+    """Map a structure whose tensors have leading dim ``groups*batch`` (member-major)
+    back to leading ``[groups, batch, ...]``. Used to post-process a single
+    vectorised forward into the same shape the per-member loop produces."""
+    if isinstance(obj, torch.Tensor):
+        if obj.dim() >= 1 and obj.shape[0] == groups * batch:
+            return obj.view(groups, batch, *obj.shape[1:])
+        return obj
+    if _is_model_output(obj):
+        fields = {}
+        for k in obj.keys():
+            if k in drop_keys or obj.get(k) is None:
+                continue
+            fields[k] = _reshape_leading(obj[k], groups, batch, drop_keys)
+        return type(obj)(**fields)
+    if isinstance(obj, dict):
+        return {k: _reshape_leading(v, groups, batch, drop_keys) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        z = [_reshape_leading(v, groups, batch, drop_keys) for v in obj]
+        return tuple(z) if isinstance(obj, tuple) else z
+    return obj
+
+
+# ---------------------------------------------------------------------------
+# PopulationModel: a transformers-like facade over a base model + Population.
+# ---------------------------------------------------------------------------
+class PopulationModel:
+    """
+    Bind a prepared base model to a :class:`Population` and expose a
+    transformers-like surface. The "run the model" entry points
+    (``__call__`` / ``forward`` and ``generate``) are *population-aware*: they run
+    the underlying call once per member and stack the results on a new leading
+    population axis (configurable via ``population_dim``). Every other attribute
+    (``config``, ``device``, ``get_input_embeddings``, ``to``, ``eval`` ...) falls
+    through to the wrapped model unchanged.
+
+    Examples
+    --------
+    >>> pm = population.bind(model)                     # or PopulationModel(model, population)
+    >>> out = pm(**inputs)                              # out.logits: [P, B, T, V]
+    >>> mean_logits = out.logits.mean(0)               # distributional summary
+    >>> gen = pm.generate(**inputs, max_new_tokens=32) # [P, B, T] (padded)
+
+    Per-member post-processing & memory
+    -----------------------------------
+    Materialising ``[P, B, T, vocab]`` logits is often wasteful. Pass ``reduce=fn``
+    to apply ``fn`` to each member's raw output *before* stacking, so only the
+    reduced quantity (e.g. continuation log-probs, shape ``[P, B]``) is kept:
+
+    >>> scores = pm(input_ids, reduce=lambda o: o.logits.log_softmax(-1)[..., -1, :])
+
+    Pass ``stack=False`` to get a plain list of per-member outputs (lazy-friendly,
+    full control). ``seed`` reuses common random numbers across members so that,
+    under sampled decoding, mask-driven variance is isolated from decoding noise.
+
+    Notes
+    -----
+    * By default this is ``P`` sequential forwards behind a single call. Pass
+      ``vectorized=True`` to ``forward``/``__call__`` to run a single tiled pass
+      instead (one kernel launch, ``P x`` activation memory; forward only). It is
+      exact here because the masks sit at FFN outputs and every decoder op is
+      independent across the batch axis.
+    * ``enforce_eval`` (default) holds the model in eval mode for each call so the
+      stratified masks are the only randomness; prior mode is restored after.
+    """
+
+    # Attribute lookups that should NOT fall through to the wrapped model.
+    _OWN_ATTRS = frozenset({"model", "population", "population_dim", "enforce_eval"})
+
+    def __init__(self, model: torch.nn.Module, population: Population, *,
+                 population_dim: int = 0, validate: bool = True,
+                 strict_class: bool = True, enforce_eval: bool = True):
+        object.__setattr__(self, "model", model)
+        object.__setattr__(self, "population", population)
+        object.__setattr__(self, "population_dim", population_dim)
+        object.__setattr__(self, "enforce_eval", enforce_eval)
+        if validate:
+            population.validate(model, strict_class=strict_class)
+        _align_population_device(model, population)
+        _restore_population_state(model, population)
+
+    # -- introspection -----------------------------------------------------
+    def __len__(self):
+        return len(self.population)
+
+    def __repr__(self):
+        return (f"PopulationModel(members={len(self.population)}, "
+                f"model={type(self.model).__name__}, population_dim={self.population_dim})")
+
+    def __getattr__(self, name):
+        # Only reached when normal lookup fails -> delegate to the base model.
+        # (self.model is set via object.__setattr__ in __init__, so this is safe.)
+        return getattr(object.__getattribute__(self, "model"), name)
+
+    # -- core member loop --------------------------------------------------
+    def _run(self, call, *, reduce=None, stack=True, seed=None,
+             population_dim=None, pad_value=0):
+        prev_training = self.model.training
+        if self.enforce_eval:
+            self.model.eval()
+        outs = []
+        try:
+            for identity in self.population.identities:
+                DropoutUtils.set_stratified_dropout_identity(self.model, identity, strict=True)
+                if seed is not None:
+                    torch.manual_seed(seed)
+                with torch.no_grad():
+                    o = call()
+                outs.append(reduce(o) if reduce is not None else o)
+        finally:
+            if self.enforce_eval and prev_training:
+                self.model.train()
+        if not stack:
+            return outs
+        dim = self.population_dim if population_dim is None else population_dim
+        return stack_outputs(outs, dim=dim, pad_value=pad_value)
+
+    def map(self, fn, *, stack=True, seed=None, population_dim=None):
+        """Run an arbitrary ``fn()`` (no args) once per member -- the general
+        escape hatch, equivalent to :func:`apply_population` but bound."""
+        return self._run(fn, stack=stack, seed=seed, population_dim=population_dim)
+
+    # -- population-aware entry points -------------------------------------
+    def forward(self, *args, reduce=None, stack=True, seed=None,
+                vectorized=False, population_dim=None, **kwargs):
+        if vectorized:
+            return self._forward_vectorized(args, kwargs, reduce=reduce,
+                                            population_dim=population_dim)
+        return self._run(lambda: self.model(*args, **kwargs),
+                         reduce=reduce, stack=stack, seed=seed,
+                         population_dim=population_dim)
+
+    __call__ = forward
+
+    def generate(self, *args, reduce=None, stack=True, seed=None,
+                 population_dim=None, pad_value=None, **kwargs):
+        """Population ``generate``. Returns stacked sequences (a ``LongTensor``
+        of shape ``[P, B, T]``, right-padded across members with ``pad_value``)
+        or, when ``return_dict_in_generate=True``, a stacked ``GenerateOutput``
+        with the same population axis (ragged per-step fields fall back to lists).
+        ``pad_value`` defaults to the model's ``pad_token_id`` (then ``eos_token_id``)."""
+        if pad_value is None:
+            cfg = getattr(self.model, "config", None)
+            pad_value = getattr(cfg, "pad_token_id", None) if cfg is not None else None
+            if pad_value is None:
+                pad_value = getattr(cfg, "eos_token_id", 0) if cfg is not None else 0
+            if isinstance(pad_value, (list, tuple)):
+                pad_value = pad_value[0]
+        return self._run(lambda: self.model.generate(*args, **kwargs),
+                         reduce=reduce, stack=stack, seed=seed,
+                         population_dim=population_dim, pad_value=pad_value)
+
+    # -- optional single-pass (vectorised) forward -------------------------
+    def _forward_vectorized(self, args, kwargs, *, reduce=None, population_dim=None):
+        """One tiled forward instead of P sequential ones. Tiles the batch by P
+        (member-major), installs the whole population's masks as stacked buffers,
+        runs once, then reshapes the leading P*B axis back to [P, B, ...]."""
+        P = len(self.population)
+        batch = _infer_vectorized_batch(args, kwargs)
+        if batch is None:
+            raise ValueError("vectorized=True needs a batched tensor input "
+                             "(input_ids / inputs_embeds) to infer the batch size.")
+
+        tiled_args = tuple(_tile_batch(a, P, batch) for a in args)
+        tiled_kwargs = {k: _tile_batch(v, P, batch) for k, v in kwargs.items()}
+
+        layers = {n: m for n, m in self.model.named_modules()
+                  if isinstance(m, StratifiedDropoutMC)}
+        device = next(self.model.parameters()).device
+
+        prev_training = self.model.training
+        if self.enforce_eval:
+            self.model.eval()
+        try:
+            for name, layer in layers.items():
+                masks = [self.population.identities[i][name] for i in range(P)]
+                layer._vector_identity = torch.stack(masks, dim=0).to(device)
+                layer._vector_groups = P
+                layer.activate = True
+            with torch.no_grad():
+                raw = self.model(*tiled_args, **tiled_kwargs)
+        finally:
+            for layer in layers.values():
+                if hasattr(layer, "_vector_identity"):
+                    del layer._vector_identity
+                if hasattr(layer, "_vector_groups"):
+                    del layer._vector_groups
+            if self.enforce_eval and prev_training:
+                self.model.train()
+
+        out = _reshape_leading(raw, P, batch)
+        if reduce is not None:
+            out = reduce(out)
+        if population_dim not in (None, 0):
+            # Caller wants the population axis somewhere other than leading.
+            out = stack_outputs([out_i for out_i in _split_leading(out, P)],
+                                dim=population_dim)
+        return out
+
+
+def _infer_vectorized_batch(args, kwargs) -> Optional[int]:
+    cand = kwargs.get("input_ids")
+    if cand is None:
+        cand = kwargs.get("inputs_embeds")
+    if cand is None and args:
+        cand = args[0]
+    return cand.shape[0] if isinstance(cand, torch.Tensor) and cand.dim() >= 1 else None
+
+
+def _tile_batch(v, groups: int, batch: int):
+    """Repeat a batch-leading tensor ``groups`` times in member-major order."""
+    if isinstance(v, torch.Tensor) and v.dim() >= 1 and v.shape[0] == batch:
+        return v.repeat(groups, *([1] * (v.dim() - 1)))
+    return v
+
+
+def _split_leading(obj, groups: int):
+    """Yield ``groups`` slices along a leading population axis (for re-placing it)."""
+    for i in range(groups):
+        if isinstance(obj, torch.Tensor):
+            yield obj[i]
+        elif _is_model_output(obj) or isinstance(obj, dict):
+            yield type(obj)(**{k: (v[i] if isinstance(v, torch.Tensor) else v)
+                               for k, v in obj.items()}) if _is_model_output(obj) \
+                  else {k: (v[i] if isinstance(v, torch.Tensor) else v) for k, v in obj.items()}
+        else:
+            yield obj
+
+
+__all__ = [
+    # primitives
+    "DropoutMC", "StratifiedDropoutMC", "LockedDropoutMC", "WordDropoutMC",
+    "MC_DROPOUT_SUBSTITUTES", "DropoutUtils",
+    "generate_dropout_population", "call_function_with_population",
+    "generate_population_and_apply",
+    # insertion
+    "default_insertion_predicate",
+    # convenience layer
+    "Population", "PopulationModel", "prepare_model", "deactivate", "deactivated",
+    "generate_population", "apply_population", "stack_outputs",
+]
